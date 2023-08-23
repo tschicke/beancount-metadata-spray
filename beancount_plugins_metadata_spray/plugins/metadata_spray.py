@@ -2,6 +2,7 @@
 
 import collections
 import re
+from decimal import Decimal
 
 from beancount.core import data
 from beancount.core import account
@@ -12,9 +13,6 @@ __plugins__ = ('metadata_spray_entries',)
 
 MetadataSprayError = collections.namedtuple(
     'MetadataSprayError', 'source message entry')
-
-# Supported spray types
-MetadataSprayTypes = ['account_open']
 
 # Metadata Replace Types
 # ---
@@ -32,59 +30,64 @@ def metadata_spray(entry,
                    replace_type,
                    metadata_dict):
     errors = []
-    entry_meta = entry[0].meta
+    entry_meta = entry.meta
 
     for metadata_key in metadata_dict:
         if metadata_key in entry_meta:
             if replace_type == 'return_error':
                 error_meta = data.new_metadata(
-                    '<metadata_spray>', entry[0].meta['lineno'])
+                    '<metadata_spray>', entry.meta['lineno'])
                 errors.append(
                     MetadataSprayError(
                         error_meta,
-                        "Existing metadata \'{}\' found in account \'{}\', skipping".format(
-                            metadata_key, entry[0].account), None))
+                        "Existing metadata \'{}\' found in {} \'{}\', skipping".format(
+                            metadata_key, entry.__class__.__name__, entry.name), None))
                 continue
             elif replace_type == 'dont_overwrite':
                 continue
 
         entry_meta[metadata_key] = metadata_dict[metadata_key]
 
-    return entry_meta, errors
+    return errors
 
 
-def metadata_spray_account_open(entries,
-                                replace_type,
-                                pattern,
-                                metadata_dict):
+def spray_open(entry, config):
     errors = []
-    account_entries = getters.get_account_open_close(entries)
-    regexer = re.compile(pattern)
+    if not 'regex' in config:
+        pattern = config['pattern']
+        config['regex'] = re.compile(pattern)
+    regexer = config['regex']
 
-    for account_ in account_entries:
-        # Only operate on account Open entries
-        entry = account_entries[account_]
-        if(getattr(entry[0].__class__, '__name__') != 'Open'):
-            continue
+    if not regexer.match(entry.account):
+        return errors
+    return metadata_spray(
+        entry,
+        config['replace_type'],
+        config['metadata_dict'])
 
-        if(regexer.match(account_)):
-            spray_meta, spray_errors = metadata_spray(
-                entry,
-                replace_type,
-                metadata_dict)
-            spray_entry = data.Open(spray_meta,
-                                    entry[0].date,
-                                    entry[0].account,
-                                    None,
-                                    None)
 
-            # Modify entries and update errors
-            entry_index = entries.index(entry[0])
-            entries[entry_index] = spray_entry
-            errors += spray_errors
+def spray_commodity(entry, config):
+    errors = []
+    pattern = config['pattern']
+    if not 'regex' in config:
+        config['regex'] = re.compile(pattern)
+    regexer = config['regex']
 
-    return entries, errors
+    if not regexer.match(entry.currency):
+        #print(f'Not spraying {pattern}: {entry.currency}')
+        return errors
+    #print(f'Spraying {pattern}: {entry.currency} with {config["metadata_dict"]}')
+    return metadata_spray(
+        entry,
+        config['replace_type'],
+        config['metadata_dict'])
 
+
+# Supported spray types
+MetadataSprayHandlers = {
+    'open': spray_open,
+    'commodity': spray_commodity,
+}
 
 def metadata_spray_entries(entries, options_map, config_str):
     """
@@ -92,8 +95,9 @@ def metadata_spray_entries(entries, options_map, config_str):
     """
     errors = []
 
-    config_obj = eval(config_str, {}, {})
+    config_obj = eval(config_str, {'Decimal': Decimal}, {})
     sprays = config_obj['sprays']
+    spray_dict = {}
     for spray in sprays:
 
         if ('spray_type' not in spray) or \
@@ -107,7 +111,7 @@ def metadata_spray_entries(entries, options_map, config_str):
             continue
 
         spray_type = spray['spray_type']
-        if spray_type not in MetadataSprayTypes:
+        if spray_type not in MetadataSprayHandlers:
             errors.append(
                 MetadataSprayError(metadata_spray_error_meta,
                                    "Invalid spray type: {} \
@@ -126,12 +130,18 @@ def metadata_spray_entries(entries, options_map, config_str):
                                    None))
             continue
 
-        if spray_type == 'account_open':
-            entries, new_errors = metadata_spray_account_open(
-                entries,
-                replace_type,
-                spray['pattern'],
-                spray['metadata_dict'])
-            errors += new_errors
+        if spray_type not in spray_dict:
+            spray_dict[spray_type] = []
+
+        spray_dict[spray_type].append(spray)
+
+    for entry in entries:
+        spray_type = entry.__class__.__name__.lower()
+        sprays = spray_dict.get(spray_type, None)
+        if sprays is None:
+            continue
+
+        for spray in sprays:
+            errors += MetadataSprayHandlers[spray_type](entry, spray)
 
     return entries, errors
